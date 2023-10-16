@@ -9,7 +9,7 @@ matplotlib
 seaborn
 requests
 pvlib
-cvxpy>=1.1.0
+cvxpy>=1.3.2
 cmake
 pykml
 haversine
@@ -19,10 +19,10 @@ boto3
 # Academic license info: https://www.mosek.com/products/academic-licenses/
 # Trial commercial license info: https://www.mosek.com/products/trial/
 Mosek
+osqp
+clarabel
 
 # Source: stanfordcvxgrp
 -c stanfordcvxgrp
 qss
 sig-decomp
-
-
