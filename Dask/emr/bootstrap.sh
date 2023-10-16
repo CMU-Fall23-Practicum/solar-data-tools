@@ -129,7 +129,14 @@ cd ..
 # -----------------------------------------------------------------------------
 # 3.6 Install solar-data-tools dependencies
 # -----------------------------------------------------------------------------
+
+# Add repositories
+conda config --add channels stanfordcvxgrp
+conda config --add channels conda-forge
+conda config --add channels mosek
+# Install dependencies (listed in requirements.txt)
 conda install --file ./sdt/solar-data-tools/requirements.txt
+# Configure Cassandra
 conda install cassandra-driver
 mkdir ~/.aws
 echo $'54.176.95.208\n' > ~/.aws/cassandra_cluster
