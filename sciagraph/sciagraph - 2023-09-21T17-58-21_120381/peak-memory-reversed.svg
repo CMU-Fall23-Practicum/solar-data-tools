@@ -1,0 +1,2713 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="2876" onload="init(evt)" viewBox="0 0 1200 2876" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno">
+    <!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.-->
+    <!--NOTES: -->
+    <defs>
+        <linearGradient id="background" y1="0" y2="1" x1="0" x2="0">
+            <stop stop-color="#eeeeee" offset="5%"/>
+            <stop stop-color="#eeeeb0" offset="95%"/>
+        </linearGradient>
+    </defs>
+    <style type="text/css">
+text { font-family:monospace; font-size:16px }
+#title { text-anchor:middle; font-size:21px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style>
+    <script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 16;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = true;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script>
+    <rect x="0" y="0" width="100%" height="2876" fill="url(#background)"/>
+    <text id="title" fill="rgb(0,0,0)" x="50.0000%" y="32.00">Peak tracked memory usage (11195.3 MiB), Reversed</text>
+    <text id="subtitle" x="50.0000%" y="64.00">⟲ Left/right order has no semantic meaning in this graph ⟲</text>
+    <text id="details" fill="rgb(0,0,0)" x="10" y="84.00"> </text>
+    <text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="32.00">Reset Zoom</text>
+    <text id="search" fill="rgb(0,0,0)" x="1190" y="32.00">Search</text>
+    <text id="matched" fill="rgb(0,0,0)" x="1190" y="2863.00"> </text>
+    <svg id="frames" x="10" width="1180" total_samples="11672808927">
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1058 (_handle_fromlist) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="452" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="465.50"></text>
+        </g>
+        <g>
+            <title>from . import _msk (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="474" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="487.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/mosek/__init__.py:11 (&lt;module&gt;) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="496" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="509.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="518" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="531.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="540" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="553.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="562" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="575.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:850 (exec_module) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="584" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="597.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="606" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="619.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:680 (_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="628" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="641.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="650" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="663.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="672" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="685.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="694" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="707.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="716" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="729.50"></text>
+        </g>
+        <g>
+            <title>        import mosek  # noqa F401 (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="738" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="751.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/reductions/solvers/conic_solvers/mosek_conif.py:136 (import_solver) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="760" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="773.50"></text>
+        </g>
+        <g>
+            <title>            self.import_solver() (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="782" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="795.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/reductions/solvers/solver.py:60 (is_installed) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="804" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="817.50"></text>
+        </g>
+        <g>
+            <title>        if solver.is_installed(): (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="826" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="839.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/reductions/solvers/defines.py:99 (installed_solvers) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="848" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="861.50"></text>
+        </g>
+        <g>
+            <title>INSTALLED_SOLVERS = installed_solvers() (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="870" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="883.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/reductions/solvers/defines.py:110 (&lt;module&gt;) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="892" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="905.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="914" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="927.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="936" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="949.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="958" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="971.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:850 (exec_module) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="980" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="993.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1002" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1015.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:680 (_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1024" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1037.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1046" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1059.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1068" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1081.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1090" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1103.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1112" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1125.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1134" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1147.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1156" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1169.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1178" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1191.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1058 (_handle_fromlist) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1200" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1213.50"></text>
+        </g>
+        <g>
+            <title>from cvxpy.reductions.solvers import defines as slv_def (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1222" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1235.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/reductions/solvers/solving_chain.py:43 (&lt;module&gt;) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1244" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1257.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1266" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1279.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1288" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1301.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1310" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1323.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:850 (exec_module) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1332" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1345.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1354" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1367.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:680 (_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1376" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1389.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1398" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1411.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1420" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1433.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1442" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1455.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1464" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1477.50"></text>
+        </g>
+        <g>
+            <title>from cvxpy.reductions.solvers.solving_chain import SolvingChain (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1486" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1499.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/reductions/__init__.py:31 (&lt;module&gt;) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1508" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1521.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1530" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1543.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1552" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1565.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1574" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1587.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:850 (exec_module) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1596" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1609.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1618" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1631.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:680 (_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1640" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1653.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1662" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1675.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1684" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1697.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1706" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1719.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1728" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1741.50"></text>
+        </g>
+        <g>
+            <title>from cvxpy.reductions import InverseData (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1750" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1763.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:37 (&lt;module&gt;) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1772" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1785.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1794" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1807.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1816" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1829.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1838" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1851.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:850 (exec_module) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1860" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1873.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1882" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1895.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:680 (_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1904" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1917.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1926" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1939.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1948" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1961.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1970" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="1983.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="1992" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2005.50"></text>
+        </g>
+        <g>
+            <title>from cvxpy.problems.problem import Problem (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2014" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2027.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/__init__.py:29 (&lt;module&gt;) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2036" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2049.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2058" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2071.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2080" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2093.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2102" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2115.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:850 (exec_module) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2124" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2137.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2146" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2159.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:680 (_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2168" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2181.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2190" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2203.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2212" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2225.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2234" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2247.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2256" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2269.50"></text>
+        </g>
+        <g>
+            <title>import cvxpy as cvx (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2278" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2291.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/clear_day_detection.py:9 (&lt;module&gt;) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2300" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2313.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2322" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2335.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2344" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2357.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2366" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2379.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:850 (exec_module) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2388" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2401.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2410" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2423.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:680 (_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2432" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2445.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2454" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2467.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2476" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2489.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2498" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2511.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2520" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2533.50"></text>
+        </g>
+        <g>
+            <title>from solardatatools.clear_day_detection import ClearDayDetection (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2542" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2555.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/__init__.py:5 (&lt;module&gt;) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2564" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2577.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2586" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2599.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2608" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2621.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2630" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2643.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:850 (exec_module) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2652" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2665.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2674" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2687.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:680 (_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2696" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2709.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2718" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2731.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2740" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2753.50"></text>
+        </g>
+        <g>
+            <title> (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2762" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2775.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2784" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2797.50"></text>
+        </g>
+        <g>
+            <title>from solardatatools import DataHandler (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2806" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2819.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/profiling.py:3 (&lt;module&gt;) (256 MiB, 2.30%)</title>
+            <rect x="0.0090%" y="2828" width="2.2997%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="268435456"/>
+            <text x="0.2590%" y="2841.50"></text>
+        </g>
+        <g>
+            <title> (257 MiB, 2.31%)</title>
+            <rect x="0.0090%" y="386" width="2.3087%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="269485225"/>
+            <text x="0.2590%" y="399.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (257 MiB, 2.31%)</title>
+            <rect x="0.0090%" y="408" width="2.3087%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="269485225"/>
+            <text x="0.2590%" y="421.50"></text>
+        </g>
+        <g>
+            <title> (257 MiB, 2.31%)</title>
+            <rect x="0.0090%" y="430" width="2.3087%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="269485225"/>
+            <text x="0.2590%" y="443.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:1173 (create_module) (258 MiB, 2.32%)</title>
+            <rect x="0.0090%" y="188" width="2.3199%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="270795945"/>
+            <text x="0.2590%" y="201.50"></text>
+        </g>
+        <g>
+            <title> (258 MiB, 2.32%)</title>
+            <rect x="0.0090%" y="210" width="2.3199%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="270795945"/>
+            <text x="0.2590%" y="223.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:565 (module_from_spec) (258 MiB, 2.32%)</title>
+            <rect x="0.0090%" y="232" width="2.3199%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="270795945"/>
+            <text x="0.2590%" y="245.50"></text>
+        </g>
+        <g>
+            <title> (258 MiB, 2.32%)</title>
+            <rect x="0.0090%" y="254" width="2.3199%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="270795945"/>
+            <text x="0.2590%" y="267.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:666 (_load_unlocked) (258 MiB, 2.32%)</title>
+            <rect x="0.0090%" y="276" width="2.3199%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="270795945"/>
+            <text x="0.2590%" y="289.50"></text>
+        </g>
+        <g>
+            <title> (258 MiB, 2.32%)</title>
+            <rect x="0.0090%" y="298" width="2.3199%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="270795945"/>
+            <text x="0.2590%" y="311.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (258 MiB, 2.32%)</title>
+            <rect x="0.0090%" y="320" width="2.3199%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="270795945"/>
+            <text x="0.2590%" y="333.50"></text>
+        </g>
+        <g>
+            <title> (258 MiB, 2.32%)</title>
+            <rect x="0.0090%" y="342" width="2.3199%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="270795945"/>
+            <text x="0.2590%" y="355.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (258 MiB, 2.32%)</title>
+            <rect x="0.0090%" y="364" width="2.3199%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="270795945"/>
+            <text x="0.2590%" y="377.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (259 MiB, 2.33%)</title>
+            <rect x="0.0090%" y="144" width="2.3289%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="271844521"/>
+            <text x="0.2590%" y="157.50"></text>
+        </g>
+        <g>
+            <title> (259 MiB, 2.33%)</title>
+            <rect x="0.0090%" y="166" width="2.3289%" height="21" fill="rgb(255,227,227)" fg:x="1048717" fg:w="271844521"/>
+            <text x="0.2590%" y="179.50"></text>
+        </g>
+        <g>
+            <title> (294 MiB, 2.64%)</title>
+            <rect x="0.0000%" y="122" width="2.6368%" height="21" fill="rgb(255,225,225)" fg:x="0" fg:w="307785412"/>
+            <text x="0.2500%" y="135.50">..</text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:647 (_compile_bytecode) (33 MiB, 0.30%)</title>
+            <rect x="2.3446%" y="144" width="0.2922%" height="21" fill="rgb(255,241,241)" fg:x="273679670" fg:w="34105742"/>
+            <text x="2.5946%" y="157.50"></text>
+        </g>
+        <g>
+            <title> (33 MiB, 0.30%)</title>
+            <rect x="2.3446%" y="166" width="0.2922%" height="21" fill="rgb(255,241,241)" fg:x="273679670" fg:w="34105742"/>
+            <text x="2.5946%" y="179.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:978 (get_code) (32 MiB, 0.29%)</title>
+            <rect x="2.3537%" y="188" width="0.2831%" height="21" fill="rgb(255,242,242)" fg:x="274739299" fg:w="33046113"/>
+            <text x="2.6037%" y="201.50"></text>
+        </g>
+        <g>
+            <title> (32 MiB, 0.29%)</title>
+            <rect x="2.3537%" y="210" width="0.2831%" height="21" fill="rgb(255,242,242)" fg:x="274739299" fg:w="33046113"/>
+            <text x="2.6037%" y="223.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:846 (exec_module) (32 MiB, 0.29%)</title>
+            <rect x="2.3537%" y="232" width="0.2831%" height="21" fill="rgb(255,242,242)" fg:x="274739299" fg:w="33046113"/>
+            <text x="2.6037%" y="245.50"></text>
+        </g>
+        <g>
+            <title> (32 MiB, 0.29%)</title>
+            <rect x="2.3537%" y="254" width="0.2831%" height="21" fill="rgb(255,242,242)" fg:x="274739299" fg:w="33046113"/>
+            <text x="2.6037%" y="267.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:680 (_load_unlocked) (32 MiB, 0.29%)</title>
+            <rect x="2.3537%" y="276" width="0.2831%" height="21" fill="rgb(255,242,242)" fg:x="274739299" fg:w="33046113"/>
+            <text x="2.6037%" y="289.50"></text>
+        </g>
+        <g>
+            <title> (32 MiB, 0.29%)</title>
+            <rect x="2.3537%" y="298" width="0.2831%" height="21" fill="rgb(255,242,242)" fg:x="274739299" fg:w="33046113"/>
+            <text x="2.6037%" y="311.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (32 MiB, 0.29%)</title>
+            <rect x="2.3537%" y="320" width="0.2831%" height="21" fill="rgb(255,242,242)" fg:x="274739299" fg:w="33046113"/>
+            <text x="2.6037%" y="333.50"></text>
+        </g>
+        <g>
+            <title> (32 MiB, 0.29%)</title>
+            <rect x="2.3537%" y="342" width="0.2831%" height="21" fill="rgb(255,242,242)" fg:x="274739299" fg:w="33046113"/>
+            <text x="2.6037%" y="355.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (32 MiB, 0.29%)</title>
+            <rect x="2.3537%" y="364" width="0.2831%" height="21" fill="rgb(255,242,242)" fg:x="274739299" fg:w="33046113"/>
+            <text x="2.6037%" y="377.50"></text>
+        </g>
+        <g>
+            <title>DATA_CORPUS = pd.read_csv( (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="518" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="531.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/algorithms/shade.py:27 (&lt;module&gt;) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="540" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="553.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="562" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="575.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="584" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="597.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="606" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="619.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:850 (exec_module) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="628" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="641.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="650" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="663.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:680 (_load_unlocked) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="672" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="685.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="694" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="707.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="716" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="729.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="738" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="751.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="760" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="773.50"></text>
+        </g>
+        <g>
+            <title>from solardatatools.algorithms.shade import ShadeAnalysis (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="782" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="795.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/algorithms/__init__.py:5 (&lt;module&gt;) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="804" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="817.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="826" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="839.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="848" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="861.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="870" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="883.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:850 (exec_module) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="892" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="905.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="914" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="927.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:680 (_load_unlocked) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="936" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="949.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="958" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="971.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="980" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="993.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1002" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1015.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1024" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1037.50"></text>
+        </g>
+        <g>
+            <title>from solardatatools.algorithms import SunriseSunset (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1046" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1059.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/data_filling.py:12 (&lt;module&gt;) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1068" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1081.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1090" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1103.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1112" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1125.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1134" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1147.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:850 (exec_module) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1156" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1169.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1178" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1191.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:680 (_load_unlocked) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1200" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1213.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1222" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1235.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1244" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1257.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1266" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1279.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1288" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1301.50"></text>
+        </g>
+        <g>
+            <title>from solardatatools.data_filling import zero_nighttime, interp_missing (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1310" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1323.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/data_handler.py:30 (&lt;module&gt;) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1332" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1345.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1354" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1367.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1376" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1389.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1398" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1411.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:850 (exec_module) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1420" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1433.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1442" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1455.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:680 (_load_unlocked) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1464" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1477.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1486" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1499.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1508" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1521.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1530" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1543.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1552" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1565.50"></text>
+        </g>
+        <g>
+            <title>from solardatatools.data_handler import DataHandler (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1574" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1587.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/__init__.py:9 (&lt;module&gt;) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1596" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1609.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1618" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1631.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:228 (_call_with_frames_removed) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1640" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1653.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1662" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1675.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap_external&gt;:850 (exec_module) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1684" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1697.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1706" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1719.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:680 (_load_unlocked) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1728" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1741.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1750" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1763.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:986 (_find_and_load_unlocked) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1772" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1785.50"></text>
+        </g>
+        <g>
+            <title> (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1794" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1807.50"></text>
+        </g>
+        <g>
+            <title>&lt;frozen importlib._bootstrap&gt;:1007 (_find_and_load) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1816" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1829.50"></text>
+        </g>
+        <g>
+            <title>from solardatatools import DataHandler (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1838" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1851.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/profiling.py:3 (&lt;module&gt;) (65 MiB, 0.58%)</title>
+            <rect x="2.7771%" y="1860" width="0.5852%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="68304001"/>
+            <text x="3.0271%" y="1873.50"></text>
+        </g>
+        <g>
+            <title>    stacked = np.empty(shape, dtype=dtype) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="122" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="135.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/pandas/core/internals/managers.py:2200 (_stack_arrays) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="144" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="157.50"></text>
+        </g>
+        <g>
+            <title>            values, placement = _stack_arrays(list(tup_block), dtype) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="166" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="179.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/pandas/core/internals/managers.py:2160 (_form_blocks) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="188" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="201.50"></text>
+        </g>
+        <g>
+            <title>        blocks = _form_blocks(arrays, consolidate, refs) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="210" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="223.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/pandas/core/internals/managers.py:2086 (create_block_manager_from_column_arrays) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="232" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="245.50"></text>
+        </g>
+        <g>
+            <title>        return create_block_manager_from_column_arrays( (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="254" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="267.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/pandas/core/internals/construction.py:152 (arrays_to_mgr) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="276" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="289.50"></text>
+        </g>
+        <g>
+            <title>    return arrays_to_mgr(arrays, columns, index, dtype=dtype, typ=typ, consolidate=copy) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="298" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="311.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/pandas/core/internals/construction.py:503 (dict_to_mgr) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="320" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="333.50"></text>
+        </g>
+        <g>
+            <title>            mgr = dict_to_mgr(data, index, columns, dtype=dtype, copy=copy, typ=manager) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="342" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="355.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/pandas/core/frame.py:736 (__init__) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="364" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="377.50"></text>
+        </g>
+        <g>
+            <title>            df = DataFrame(col_dict, columns=columns, index=index) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="386" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="399.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/pandas/io/parsers/readers.py:1765 (read) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="408" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="421.50"></text>
+        </g>
+        <g>
+            <title>        return parser.read(nrows) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="430" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="443.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/pandas/io/parsers/readers.py:617 (_read) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="452" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="465.50"></text>
+        </g>
+        <g>
+            <title>    return _read(filepath_or_buffer, kwds) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="474" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="487.50"></text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/pandas/io/parsers/readers.py:948 (read_csv) (68 MiB, 0.61%)</title>
+            <rect x="2.7771%" y="496" width="0.6093%" height="21" fill="rgb(255,238,238)" fg:x="324163260" fg:w="71121823"/>
+            <text x="3.0271%" y="509.50"></text>
+        </g>
+        <g>
+            <title>    xfin = isfinite(x) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="122" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="135.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/numpy/core/numeric.py:2348 (isclose) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="144" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="157.50">/hom..</text>
+        </g>
+        <g>
+            <title>    res = all(isclose(a, b, rtol=rtol, atol=atol, equal_nan=equal_nan)) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="166" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="179.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/numpy/core/numeric.py:2241 (allclose) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="188" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="201.50">/hom..</text>
+        </g>
+        <g>
+            <title>    return np.allclose(off_diagonal_elements, 0) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="210" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="223.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/linalg.py:45 (is_diagonal) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="232" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="245.50">/hom..</text>
+        </g>
+        <g>
+            <title>    if is_diagonal(A): (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="254" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="267.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/linalg.py:77 (is_psd_within_tol) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="276" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="289.50">/hom..</text>
+        </g>
+        <g>
+            <title>            self._nsd_test = eig_util.is_psd_within_tol(-self.value, EIGVAL_TOL) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="298" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="311.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/expressions/constants/constant.py:244 (is_nsd) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="320" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="333.50">/hom..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="342" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="355.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="364" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="377.50">/hom..</text>
+        </g>
+        <g>
+            <title>        return P.is_constant() and P.is_nsd() (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="386" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="399.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/atoms/quad_form.py:74 (is_atom_concave) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="408" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="421.50">/hom..</text>
+        </g>
+        <g>
+            <title>        elif self.is_atom_concave(): (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="430" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="443.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/atoms/atom.py:193 (is_concave) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="452" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="465.50">/hom..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="474" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="487.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="496" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="509.50">/hom..</text>
+        </g>
+        <g>
+            <title>        return self.is_constant() or (self.is_convex() and self.is_concave()) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="518" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="531.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/expressions/expression.py:212 (is_affine) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="540" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="553.50">/hom..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="562" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="575.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="584" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="597.50">/hom..</text>
+        </g>
+        <g>
+            <title>                if not (arg.is_affine() or (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="606" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="619.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/atoms/atom.py:178 (is_convex) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="628" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="641.50">/hom..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="650" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="663.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="672" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="685.50">/hom..</text>
+        </g>
+        <g>
+            <title>        return self.is_constant() or (self.is_convex() and self.is_concave()) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="694" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="707.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/expressions/expression.py:212 (is_affine) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="716" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="729.50">/hom..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="738" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="751.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="760" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="773.50">/hom..</text>
+        </g>
+        <g>
+            <title>                if not (arg.is_affine() or (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="782" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="795.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/atoms/atom.py:178 (is_convex) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="804" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="817.50">/hom..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="826" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="839.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="848" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="861.50">/hom..</text>
+        </g>
+        <g>
+            <title>        return self.args[0].is_convex() (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="870" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="883.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/objective.py:153 (is_dcp) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="892" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="905.50">/hom..</text>
+        </g>
+        <g>
+            <title>          expr.is_dcp(dpp) for expr in self.constraints + [self.objective]) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="914" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="927.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:257 (&lt;genexpr&gt;) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="936" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="949.50">/hom..</text>
+        </g>
+        <g>
+            <title>        return all( (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="958" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="971.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:256 (is_dcp) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="980" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="993.50">/hom..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1002" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1015.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1024" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1037.50">/hom..</text>
+        </g>
+        <g>
+            <title>    if not gp and not problem.is_dcp(): (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1046" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1059.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/reductions/solvers/solving_chain.py:107 (_reductions_for_problem_class) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1068" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1081.50">/hom..</text>
+        </g>
+        <g>
+            <title>    reductions = _reductions_for_problem_class(problem, candidates, gp, solver_opts) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1090" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1103.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/reductions/solvers/solving_chain.py:197 (construct_solving_chain) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1112" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1125.50">/hom..</text>
+        </g>
+        <g>
+            <title>        return construct_solving_chain(self, candidate_solvers, gp=gp, (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1134" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1147.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:885 (_construct_chain) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1156" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1169.50">/hom..</text>
+        </g>
+        <g>
+            <title>            solving_chain = self._construct_chain( (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1178" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1191.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:633 (get_problem_data) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1200" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1213.50">/hom..</text>
+        </g>
+        <g>
+            <title>        data, solving_chain, inverse_data = self.get_problem_data( (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1222" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1235.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:1056 (_solve) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1244" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1257.50">/hom..</text>
+        </g>
+        <g>
+            <title>        return solve_func(self, *args, **kwargs) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1266" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1279.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:495 (solve) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1288" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1301.50">/hom..</text>
+        </g>
+        <g>
+            <title>        cvx_prob.solve(solver=solver, **solver_kwargs) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1310" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1323.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/gfosd/problem.py:200 (_solve_cvx) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1332" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1345.50">/hom..</text>
+        </g>
+        <g>
+            <title>            result = self._solve_cvx(canonical_form, solver, **kwargs) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1354" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1367.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/gfosd/problem.py:93 (decompose) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1376" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1389.50">/hom..</text>
+        </g>
+        <g>
+            <title>    problem.decompose(solver=solver, verbose=verbose, eps_rel=1e-6, eps_abs=1e-6) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1398" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1411.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/_osd_signal_decompositions.py:277 (_osd_l2_l1d2_constrained) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1420" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1433.50">/hom..</text>
+        </g>
+        <g>
+            <title>        res = _osd_l2_l1d2_constrained( (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1442" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1455.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/signal_decompositions.py:259 (l2_l1d2_constrained) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1464" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1477.50">/hom..</text>
+        </g>
+        <g>
+            <title>        out = l2_l1d2_constrained(y, w1=weight, solver=solver) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1486" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1499.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/algorithms/clipping.py:373 (get_l2_l1d2) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1508" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1521.50">/hom..</text>
+        </g>
+        <g>
+            <title>            self.get_l2_l1d2(y_rs, weight=weight, solver=solver) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1530" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1543.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/algorithms/clipping.py:139 (pointmass_detection) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1552" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1565.50">/hom..</text>
+        </g>
+        <g>
+            <title>        self.pointmass_detection( (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1574" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1587.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/algorithms/clipping.py:75 (check_clipping) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1596" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1609.50">/hom..</text>
+        </g>
+        <g>
+            <title>        self.clipping_analysis.check_clipping( (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1618" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1631.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/data_handler.py:868 (clipping_check) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1640" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1653.50">/hom..</text>
+        </g>
+        <g>
+            <title>            self.clipping_check(solver=solver_convex) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1662" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1675.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/data_handler.py:375 (run_pipeline) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1684" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1697.50">/hom..</text>
+        </g>
+        <g>
+            <title>                dh.run_pipeline(power_col=&apos;ac_power_01&apos;) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1706" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1719.50">   ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/profiling.py:35 (&lt;module&gt;) (596 MiB, 5.35%)</title>
+            <rect x="3.3864%" y="1728" width="5.3535%" height="21" fill="rgb(255,215,215)" fg:x="395285083" fg:w="624900060"/>
+            <text x="3.6364%" y="1741.50">/hom..</text>
+        </g>
+        <g>
+            <title>            return less_equal(abs(x-y), atol + rtol * abs(y)) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="122" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="135.50">            return less_equal(abs(x-y), atol + rtol * abs(..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/numpy/core/numeric.py:2332 (within_tol) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="144" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="157.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/numpy/co..</text>
+        </g>
+        <g>
+            <title>        return within_tol(x, y, atol, rtol) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="166" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="179.50">        return within_tol(x, y, atol, rtol)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/numpy/core/numeric.py:2351 (isclose) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="188" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="201.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/numpy/co..</text>
+        </g>
+        <g>
+            <title>    res = all(isclose(a, b, rtol=rtol, atol=atol, equal_nan=equal_nan)) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="210" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="223.50">    res = all(isclose(a, b, rtol=rtol, atol=atol, equal_na..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/numpy/core/numeric.py:2241 (allclose) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="232" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="245.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/numpy/co..</text>
+        </g>
+        <g>
+            <title>    return np.allclose(off_diagonal_elements, 0) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="254" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="267.50">    return np.allclose(off_diagonal_elements, 0)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/linalg.py:45 (is_diagonal) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="276" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="289.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/ut..</text>
+        </g>
+        <g>
+            <title>    if is_diagonal(A): (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="298" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="311.50">    if is_diagonal(A):</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/linalg.py:77 (is_psd_within_tol) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="320" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="333.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/ut..</text>
+        </g>
+        <g>
+            <title>            self._nsd_test = eig_util.is_psd_within_tol(-self.value, EIGVAL_TOL) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="342" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="355.50">            self._nsd_test = eig_util.is_psd_within_tol(-s..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/expressions/constants/constant.py:244 (is_nsd) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="364" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="377.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/ex..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="386" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="399.50">        result = func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="408" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="421.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/ut..</text>
+        </g>
+        <g>
+            <title>        return P.is_constant() and P.is_nsd() (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="430" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="443.50">        return P.is_constant() and P.is_nsd()..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/atoms/quad_form.py:74 (is_atom_concave) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="452" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="465.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/at..</text>
+        </g>
+        <g>
+            <title>        elif self.is_atom_concave(): (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="474" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="487.50">        elif self.is_atom_concave():</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/atoms/atom.py:193 (is_concave) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="496" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="509.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/at..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="518" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="531.50">        result = func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="540" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="553.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/ut..</text>
+        </g>
+        <g>
+            <title>        return self.is_constant() or (self.is_convex() and self.is_concave()) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="562" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="575.50">        return self.is_constant() or (self.is_convex() and..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/expressions/expression.py:212 (is_affine) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="584" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="597.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/ex..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="606" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="619.50">        result = func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="628" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="641.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/ut..</text>
+        </g>
+        <g>
+            <title>                if not (arg.is_affine() or (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="650" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="663.50">                if not (arg.is_affine() or..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/atoms/atom.py:178 (is_convex) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="672" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="685.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/at..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="694" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="707.50">        result = func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="716" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="729.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/ut..</text>
+        </g>
+        <g>
+            <title>        return self.is_constant() or (self.is_convex() and self.is_concave()) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="738" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="751.50">        return self.is_constant() or (self.is_convex() and..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/expressions/expression.py:212 (is_affine) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="760" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="773.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/ex..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="782" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="795.50">        result = func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="804" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="817.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/ut..</text>
+        </g>
+        <g>
+            <title>                if not (arg.is_affine() or (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="826" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="839.50">                if not (arg.is_affine() or..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/atoms/atom.py:178 (is_convex) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="848" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="861.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/at..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="870" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="883.50">        result = func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="892" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="905.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/ut..</text>
+        </g>
+        <g>
+            <title>        return self.args[0].is_convex() (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="914" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="927.50">        return self.args[0].is_convex()</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/objective.py:153 (is_dcp) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="936" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="949.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/pr..</text>
+        </g>
+        <g>
+            <title>          expr.is_dcp(dpp) for expr in self.constraints + [self.objective]) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="958" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="971.50">          expr.is_dcp(dpp) for expr in self.constraints + ..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:257 (&lt;genexpr&gt;) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="980" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="993.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/pr..</text>
+        </g>
+        <g>
+            <title>        return all( (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1002" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1015.50">        return all(</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:256 (is_dcp) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1024" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1037.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/pr..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1046" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1059.50">        result = func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1068" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1081.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/ut..</text>
+        </g>
+        <g>
+            <title>    if not gp and not problem.is_dcp(): (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1090" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1103.50">    if not gp and not problem.is_dcp():</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/reductions/solvers/solving_chain.py:107 (_reductions_for_problem_class) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1112" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1125.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/re..</text>
+        </g>
+        <g>
+            <title>    reductions = _reductions_for_problem_class(problem, candidates, gp, solver_opts) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1134" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1147.50">    reductions = _reductions_for_problem_class(problem, ca..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/reductions/solvers/solving_chain.py:197 (construct_solving_chain) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1156" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1169.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/re..</text>
+        </g>
+        <g>
+            <title>        return construct_solving_chain(self, candidate_solvers, gp=gp, (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1178" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1191.50">        return construct_solving_chain(self, candidate_sol..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:885 (_construct_chain) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1200" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1213.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/pr..</text>
+        </g>
+        <g>
+            <title>            solving_chain = self._construct_chain( (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1222" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1235.50">            solving_chain = self._construct_chain(..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:633 (get_problem_data) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1244" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1257.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/pr..</text>
+        </g>
+        <g>
+            <title>        data, solving_chain, inverse_data = self.get_problem_data( (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1266" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1279.50">        data, solving_chain, inverse_data = self.get_probl..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:1056 (_solve) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1288" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1301.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/pr..</text>
+        </g>
+        <g>
+            <title>        return solve_func(self, *args, **kwargs) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1310" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1323.50">        return solve_func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:495 (solve) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1332" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1345.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/pr..</text>
+        </g>
+        <g>
+            <title>        cvx_prob.solve(solver=solver, **solver_kwargs) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1354" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1367.50">        cvx_prob.solve(solver=solver, **solver_kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/gfosd/problem.py:200 (_solve_cvx) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1376" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1389.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/gfosd/pr..</text>
+        </g>
+        <g>
+            <title>            result = self._solve_cvx(canonical_form, solver, **kwargs) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1398" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1411.50">            result = self._solve_cvx(canonical_form, solve..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/gfosd/problem.py:93 (decompose) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1420" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1433.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/gfosd/pr..</text>
+        </g>
+        <g>
+            <title>    problem.decompose(solver=solver, verbose=verbose, eps_rel=1e-6, eps_abs=1e-6) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1442" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1455.50">    problem.decompose(solver=solver, verbose=verbose, eps_..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/_osd_signal_decompositions.py:277 (_osd_l2_l1d2_constrained) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1464" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1477.50">/home/ec2-user/solar-data-tools/solardatatools/_osd_signal_..</text>
+        </g>
+        <g>
+            <title>        res = _osd_l2_l1d2_constrained( (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1486" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1499.50">        res = _osd_l2_l1d2_constrained(..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/signal_decompositions.py:259 (l2_l1d2_constrained) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1508" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1521.50">/home/ec2-user/solar-data-tools/solardatatools/signal_decom..</text>
+        </g>
+        <g>
+            <title>        out = l2_l1d2_constrained(y, w1=weight, solver=solver) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1530" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1543.50">        out = l2_l1d2_constrained(y, w1=weight, solver=sol..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/algorithms/clipping.py:373 (get_l2_l1d2) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1552" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1565.50">/home/ec2-user/solar-data-tools/solardatatools/algorithms/c..</text>
+        </g>
+        <g>
+            <title>            self.get_l2_l1d2(y_rs, weight=weight, solver=solver) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1574" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1587.50">            self.get_l2_l1d2(y_rs, weight=weight, solver=s..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/algorithms/clipping.py:139 (pointmass_detection) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1596" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1609.50">/home/ec2-user/solar-data-tools/solardatatools/algorithms/c..</text>
+        </g>
+        <g>
+            <title>        self.pointmass_detection( (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1618" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1631.50">        self.pointmass_detection(</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/algorithms/clipping.py:75 (check_clipping) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1640" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1653.50">/home/ec2-user/solar-data-tools/solardatatools/algorithms/c..</text>
+        </g>
+        <g>
+            <title>        self.clipping_analysis.check_clipping( (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1662" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1675.50">        self.clipping_analysis.check_clipping(..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/data_handler.py:868 (clipping_check) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1684" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1697.50">/home/ec2-user/solar-data-tools/solardatatools/data_handler..</text>
+        </g>
+        <g>
+            <title>            self.clipping_check(solver=solver_convex) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1706" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1719.50">            self.clipping_check(solver=solver_convex)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/data_handler.py:375 (run_pipeline) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1728" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1741.50">/home/ec2-user/solar-data-tools/solardatatools/data_handler..</text>
+        </g>
+        <g>
+            <title>                dh.run_pipeline(power_col=&apos;ac_power_01&apos;) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1750" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1763.50">                dh.run_pipeline(power_col=&apos;ac_power_01&apos;)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/profiling.py:35 (&lt;module&gt;) (5,364 MiB, 48.19%)</title>
+            <rect x="8.8871%" y="1772" width="48.1847%" height="21" fill="rgb(255,145,145)" fg:x="1037377208" fg:w="5624510372"/>
+            <text x="9.1371%" y="1785.50">/home/ec2-user/solar-data-tools/profiling.py:35 (&lt;module&gt;)</text>
+        </g>
+        <g>
+            <title>            return np.zeros(self.shape, dtype=self.dtype, order=order) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="122" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="135.50">            return np.zeros(self.shape, dtype=self...</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/scipy/sparse/_base.py:1267 (_process_toarray_args) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="144" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="157.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/s..</text>
+        </g>
+        <g>
+            <title>        out = self._process_toarray_args(order, out) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="166" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="179.50">        out = self._process_toarray_args(order, out..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/scipy/sparse/_compressed.py:1050 (toarray) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="188" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="201.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/s..</text>
+        </g>
+        <g>
+            <title>        off_diagonal_elements = off_diagonal_elements.toarray() (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="210" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="223.50">        off_diagonal_elements = off_diagonal_elemen..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/linalg.py:39 (is_diagonal) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="232" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="245.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>    if is_diagonal(A): (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="254" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="267.50">    if is_diagonal(A):</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/linalg.py:77 (is_psd_within_tol) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="276" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="289.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>            self._nsd_test = eig_util.is_psd_within_tol(-self.value, EIGVAL_TOL) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="298" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="311.50">            self._nsd_test = eig_util.is_psd_within..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/expressions/constants/constant.py:244 (is_nsd) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="320" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="333.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="342" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="355.50">        result = func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="364" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="377.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        return P.is_constant() and P.is_nsd() (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="386" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="399.50">        return P.is_constant() and P.is_nsd()..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/atoms/quad_form.py:74 (is_atom_concave) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="408" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="421.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        elif self.is_atom_concave(): (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="430" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="443.50">        elif self.is_atom_concave():..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/atoms/atom.py:193 (is_concave) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="452" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="465.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="474" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="487.50">        result = func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="496" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="509.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        return self.is_constant() or (self.is_convex() and self.is_concave()) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="518" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="531.50">        return self.is_constant() or (self.is_conve..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/expressions/expression.py:212 (is_affine) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="540" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="553.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="562" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="575.50">        result = func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="584" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="597.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>                if not (arg.is_affine() or (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="606" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="619.50">                if not (arg.is_affine() or..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/atoms/atom.py:178 (is_convex) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="628" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="641.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="650" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="663.50">        result = func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="672" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="685.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        return self.is_constant() or (self.is_convex() and self.is_concave()) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="694" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="707.50">        return self.is_constant() or (self.is_conve..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/expressions/expression.py:212 (is_affine) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="716" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="729.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="738" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="751.50">        result = func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="760" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="773.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>                if not (arg.is_affine() or (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="782" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="795.50">                if not (arg.is_affine() or..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/atoms/atom.py:178 (is_convex) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="804" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="817.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="826" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="839.50">        result = func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="848" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="861.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        return self.args[0].is_convex() (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="870" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="883.50">        return self.args[0].is_convex()..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/objective.py:153 (is_dcp) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="892" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="905.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>          expr.is_dcp(dpp) for expr in self.constraints + [self.objective]) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="914" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="927.50">          expr.is_dcp(dpp) for expr in self.constra..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:257 (&lt;genexpr&gt;) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="936" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="949.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        return all( (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="958" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="971.50">        return all(</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:256 (is_dcp) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="980" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="993.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        result = func(self, *args, **kwargs) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1002" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1015.50">        result = func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/utilities/performance_utils.py:73 (_compute_once) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1024" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1037.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>    if not gp and not problem.is_dcp(): (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1046" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1059.50">    if not gp and not problem.is_dcp():..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/reductions/solvers/solving_chain.py:107 (_reductions_for_problem_class) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1068" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1081.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>    reductions = _reductions_for_problem_class(problem, candidates, gp, solver_opts) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1090" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1103.50">    reductions = _reductions_for_problem_class(prob..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/reductions/solvers/solving_chain.py:197 (construct_solving_chain) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1112" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1125.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        return construct_solving_chain(self, candidate_solvers, gp=gp, (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1134" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1147.50">        return construct_solving_chain(self, candid..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:885 (_construct_chain) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1156" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1169.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>            solving_chain = self._construct_chain( (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1178" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1191.50">            solving_chain = self._construct_chain(..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:633 (get_problem_data) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1200" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1213.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        data, solving_chain, inverse_data = self.get_problem_data( (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1222" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1235.50">        data, solving_chain, inverse_data = self.ge..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:1056 (_solve) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1244" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1257.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        return solve_func(self, *args, **kwargs) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1266" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1279.50">        return solve_func(self, *args, **kwargs)..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/cvxpy/problems/problem.py:495 (solve) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1288" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1301.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/c..</text>
+        </g>
+        <g>
+            <title>        cvx_prob.solve(solver=solver, **solver_kwargs) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1310" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1323.50">        cvx_prob.solve(solver=solver, **solver_kwar..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/gfosd/problem.py:200 (_solve_cvx) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1332" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1345.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/g..</text>
+        </g>
+        <g>
+            <title>            result = self._solve_cvx(canonical_form, solver, **kwargs) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1354" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1367.50">            result = self._solve_cvx(canonical_form..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/.venv/lib64/python3.9/site-packages/gfosd/problem.py:93 (decompose) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1376" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1389.50">/home/ec2-user/.venv/lib64/python3.9/site-packages/g..</text>
+        </g>
+        <g>
+            <title>    problem.decompose(solver=solver, verbose=verbose, eps_rel=1e-6, eps_abs=1e-6) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1398" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1411.50">    problem.decompose(solver=solver, verbose=verbos..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/_osd_signal_decompositions.py:277 (_osd_l2_l1d2_constrained) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1420" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1433.50">/home/ec2-user/solar-data-tools/solardatatools/_osd_..</text>
+        </g>
+        <g>
+            <title>        res = _osd_l2_l1d2_constrained( (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1442" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1455.50">        res = _osd_l2_l1d2_constrained(..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/signal_decompositions.py:259 (l2_l1d2_constrained) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1464" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1477.50">/home/ec2-user/solar-data-tools/solardatatools/signa..</text>
+        </g>
+        <g>
+            <title>        out = l2_l1d2_constrained(y, w1=weight, solver=solver) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1486" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1499.50">        out = l2_l1d2_constrained(y, w1=weight, sol..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/algorithms/clipping.py:373 (get_l2_l1d2) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1508" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1521.50">/home/ec2-user/solar-data-tools/solardatatools/algor..</text>
+        </g>
+        <g>
+            <title>            self.get_l2_l1d2(y_rs, weight=weight, solver=solver) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1530" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1543.50">            self.get_l2_l1d2(y_rs, weight=weight, s..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/algorithms/clipping.py:139 (pointmass_detection) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1552" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1565.50">/home/ec2-user/solar-data-tools/solardatatools/algor..</text>
+        </g>
+        <g>
+            <title>        self.pointmass_detection( (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1574" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1587.50">        self.pointmass_detection(</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/algorithms/clipping.py:75 (check_clipping) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1596" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1609.50">/home/ec2-user/solar-data-tools/solardatatools/algor..</text>
+        </g>
+        <g>
+            <title>        self.clipping_analysis.check_clipping( (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1618" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1631.50">        self.clipping_analysis.check_clipping(..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/data_handler.py:868 (clipping_check) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1640" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1653.50">/home/ec2-user/solar-data-tools/solardatatools/data_..</text>
+        </g>
+        <g>
+            <title>            self.clipping_check(solver=solver_convex) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1662" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1675.50">            self.clipping_check(solver=solver_conve..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/solardatatools/data_handler.py:375 (run_pipeline) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1684" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1697.50">/home/ec2-user/solar-data-tools/solardatatools/data_..</text>
+        </g>
+        <g>
+            <title>                dh.run_pipeline(power_col=&apos;ac_power_01&apos;) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1706" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1719.50">                dh.run_pipeline(power_col=&apos;ac_power..</text>
+        </g>
+        <g>
+            <title>/home/ec2-user/solar-data-tools/profiling.py:35 (&lt;module&gt;) (4,768 MiB, 42.83%)</title>
+            <rect x="57.0718%" y="1728" width="42.8313%" height="21" fill="rgb(255,151,151)" fg:x="6661887580" fg:w="4999610368"/>
+            <text x="57.3218%" y="1741.50">/home/ec2-user/solar-data-tools/profiling.py:35 (&lt;mo..</text>
+        </g>
+        <g>
+            <title>all (11,132 MiB, 100%)</title>
+            <rect x="0.0000%" y="100" width="100.0000%" height="21" fill="rgb(255,100,100)" fg:x="0" fg:w="11672808927"/>
+            <text x="0.2500%" y="113.50"></text>
+        </g>
+    </svg>
+</svg>

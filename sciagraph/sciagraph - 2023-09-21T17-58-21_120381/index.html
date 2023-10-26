@@ -1,0 +1,284 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sciagraph Profiling Report (2023-09-21T17:59:00.922364884Z)</title>
+  <style type="text/css">
+   body {
+       font-family: 'Helvetica Neue','Arial Nova',Helvetica,Arial,sans-serif !important;
+       line-height: 1.4 !important;
+       font-size: 18px !important;
+   }
+   summary {
+       text-decoration: underline;
+   }
+   details {
+       cursor: pointer;
+   }
+   h1, h2, h3 {
+       margin-top: 2rem !important;
+   }
+   .svg-container {
+       resize: vertical;
+       overflow-y: scroll;
+       height: fit-content;
+   }
+   .svg-container-2 {
+       padding: 10px;
+   }
+   .slider-handle {
+       box-shadow: 1px 1px 2px #666666;
+   }
+   .timeline-headline {
+       position: relative;
+       margin-bottom: 10px;
+       padding-bottom: 0px;
+       margin-left: 10px;
+   }
+  </style>
+  <script>
+   function compatRequestFullscreen(elem) {
+       if (elem.requestFullscreen) {
+           return elem.requestFullscreen();
+       } else if (elem.webkitRequestFullscreen) {
+           return elem.webkitRequestFullscreen();
+       } else if (elem.mozRequestFullScreen) {
+           return elem.mozRequestFullScreen();
+       } else if (elem.msRequestFullscreen) {
+           return elem.msRequestFullscreen();
+       }
+   }
+   function fullScreen(id) {
+       var elem = document.querySelector(id);
+       var currentHeight = elem.style.height;
+       elem.style.height = "100%";
+       compatRequestFullscreen(elem).finally(
+           (info) => {elem.style.height = currentHeight;}
+       );
+   }
+
+   function loaded() {
+       document.querySelectorAll('.svg-container').forEach(element => {
+           element.style.maxHeight = element.offsetHeight;
+       });
+   }
+   window.onload = loaded;
+   setTimeout(loaded, 1000); // for Chrome
+  </script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/foundation-sites@6.7.4/dist/css/foundation.min.css" crossorigin="anonymous">
+  <script src="https://cdn.jsdelivr.net/npm/jquery@3.6.0/dist/jquery.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/foundation-sites@6.7.4/dist/js/foundation.min.js" crossorigin="anonymous"></script>
+</head>
+<body>
+    <div class="grid-container">
+        
+    <h1>Sciagraph Performance + Memory Profiling</h1>
+
+    
+    <div id="hobbyist_plan" class="callout warning"><strong>This report was generated using the <a href="https://sciagraph.com">Sciagraph profiler</a>'s free Hobbyist Plan, which limits your monthly usage.</strong> To upgrade to the unlimited Developer Plan please <a href="https://account.sciagraph.com/ui/">visit your account page</a>.</div>
+    
+
+    <div class="callout primary"><strong>Need help, or does something look wrong?</strong>
+        <a href="https://sciagraph.com/docs/">Read the documentation</a>,
+        and if that doesn't help please
+        <a href="mailto:support@sciagraph.com">email me</a>
+        and I'll try to help. I love questions!</div>
+
+    
+
+<h2>Job and system info</h2>
+
+<p><strong>Sciagraph version:</strong> 2023.6.1 <span style="color: #ee1111;" id="latestSciagraphVersion"></span></p>
+<p><strong>Job ID:</strong> <code>unknown</code></p>
+
+<details><summary>More details</summary>
+<p><strong>Job started:</strong> 2023-09-21T17:58:21.205873451Z</p>
+<p><strong>Job finished:</strong> 2023-09-21T17:59:00.922364884Z</p>
+<p><strong>Command:</strong> <code>/home/ec2-user/.venv/bin/python profiling.py</code></p>
+<p><strong>Hostname:</strong> ip-172-31-16-186.us-west-1.compute.internal</p>
+<p><strong>Python version:</strong> 3.9.16 (main, Sep  8 2023, 00:00:00) 
+[GCC 11.4.1 20230605 (Red Hat 11.4.1-2)]</p>
+<p><strong>OS:</strong> Linux 2023 Amazon Linux (6.1.52-71.125.amzn2023.x86_64)</p>
+<p><strong>Available CPUs:</strong> 2 &nbsp; <small>(logical CPUs, including where relevant the impact of hyperthreading, schedaffinity, and cgroups/containers)</small></p>
+</details>
+<br>
+
+    <h2>Runtime performance: combined flamegraph</h2>
+    <p>To understand concurrency and order of execution, see the timeline later in the report.</p>
+
+    <details><summary>What information does this graph provide?</summary>
+        <p>This graph combines the information from the different threads in the timeline above into a single, overall graph.</p>
+        <p>The graphs show how much time was spent in each function. A wider frame means a higher percentage of the runtime for that callstacks.
+          Order from left to right does not matter; it is not tied to execution order. Only the width of frames matters.</p>
+        <p><strong>You usually don't want to use this graph for multithreaded or multiprocessing jobs; use the timeline instead if possible.</strong>
+            In particular, the results in this graph can be misleading if you're not careful.
+            For example, if you add extra threads that just wait in parallel, the pre-existing threads' share will get smaller, even though these new waiting threads don't actually impact performance results in any way.
+        </p>
+    </details>
+    <br>
+
+    
+<details open><summary><strong>Combined threads flamegraph</strong></summary><p style="text-align: center;"><input type="button" onclick="fullScreen('#performance-svg');" value="Full screen"> · <a href="performance.svg" target="_blank"><button>Open in new window</button></a></p>
+    <div><object type="image/svg+xml" id="performance-svg" data="performance.svg" width="100%"></object></div>
+</details>
+<br>
+<br>
+<br>
+
+
+    
+<details ><summary><strong>Reversed threads flamegraph</strong></summary><p style="text-align: center;"><input type="button" onclick="fullScreen('#performance-reversed-svg');" value="Full screen"> · <a href="performance-reversed.svg" target="_blank"><button>Open in new window</button></a></p>
+    <div><object type="image/svg+xml" id="performance-reversed-svg" data="performance-reversed.svg" width="100%"></object></div>
+</details>
+<br>
+<br>
+<br>
+
+
+    <br>
+    <h2>Memory profiling: combined flamegraph</h2>
+<details><summary>What information does this graph provide?</summary>
+    <p>These graphs show how much memory was allocated at the moment of peak memory usage.</p>
+    <p>The wider (and the redder) the bar, the more memory was allocated by that function or its callers.
+        If the bar is 100% of width, that's all the allocated memory.</p>
+    <p>Order from left to right does not matter; it is not tied to execution order. Only the width of frames matters.</p>
+    <p>The first graph shows the normal callgraph: if <tt>main()</tt> calls <tt>g()</tt> calls <tt>f()</tt>, let's say, then <tt>main()</tt> will be at the top.
+       The second graph shows the reverse callgraph, from <tt>f()</tt> upwards.</p>
+    <p>Why is the second graph useful? If <tt>f()</tt> is called from multiple places, in the first graph it will show up multiple times, at the bottom.
+       In the second reversed graph all calls to <tt>f()</tt> will be merged together.</p>
+    <p>Need help reducing your data processing application's memory use? Check out these <a href="https://pythonspeed.com/memory/">howto articles</a>.</p>
+</details>
+<br>
+<details><summary>Known limitations</summary><p>OpenBLAS allocations are currently omitted, since they tend to be misleading; for more details see the <a href="https://www.sciagraph.com/docs/reference/limitations">known limitations documentation</a>.</p></details>
+    <br>
+
+    
+<details open><summary><strong>Normal memory graph</strong></summary><p style="text-align: center;"><input type="button" onclick="fullScreen('#peak-memory-svg');" value="Full screen"> · <a href="peak-memory.svg" target="_blank"><button>Open in new window</button></a></p>
+    <div><object type="image/svg+xml" id="peak-memory-svg" data="peak-memory.svg" width="100%"></object></div>
+</details>
+<br>
+<br>
+<br>
+
+
+    
+<details ><summary><strong>Reversed memory graph</strong></summary><p style="text-align: center;"><input type="button" onclick="fullScreen('#peak-memory-reversed-svg');" value="Full screen"> · <a href="peak-memory-reversed.svg" target="_blank"><button>Open in new window</button></a></p>
+    <div><object type="image/svg+xml" id="peak-memory-reversed-svg" data="peak-memory-reversed.svg" width="100%"></object></div>
+</details>
+<br>
+<br>
+<br>
+
+
+    <h2>Runtime performance: per-thread timeline</h2>
+    <details><summary>What information does this graph provide?</summary>
+
+<p>The timeline shows what code your program was running over time.
+    Specifically, in the timeline, time moves from left to right.
+    Each thread gets its own graph.
+    You can see the callstack of the calling code, and at the bottom if at that moment in time the code was running on the CPU or waiting.
+    Waiting might mean sleeping, or waiting on a lock or queue, or reading from a file, or reading from the network, etc..
+</p>
+
+<p>The graph is sampled, approximately 500-1000 samples are taken, spread out evenly across the job's runtime.
+    That means that even if the sample seems to be, say, 30 seconds, the actual code may have been doing other things during those 30 seconds.
+    However, the longer some line of code takes, the more likely it is to be sampled, so overall the graph should be reasonable approximation of where the code spent its time.</p>
+<p>Each sample is ~47ms of runtime in a single thread that is alive at that moment time.</p>
+<p>Each stacktrace ends with indication of what was going on at the time: "CPU" implies the CPU was working, "Waiting" implies the thread was blocking/waiting on some operation.</p>
+<p>Need help reducing your data processing application's runtime? Check out these <a href="https://pythonspeed.com/performance/">howto articles</a>.</p>
+    </details>
+    <br>
+
+    <details><summary>Tips and tricks</summary>
+        <ul>
+        <li>Drag the sliders on top to zoom in.</li>
+        <li>Hover over a frame to see the full text as a tooltip.</li>
+        <li>You can resize each thread timeline vertically by dragging the bottom-right corner.</li>
+        </ul>
+    </details>
+
+    <br>
+    <div style="background-color: #fcfcfc; width: 100%;">
+        <div style="position: sticky; top: 0px; z-index: 1; background-color: #fcfcfc;">
+        <div style="padding-left: 10px; padding-right: 10px;"><object type="image/svg+xml" data="performance/timeline_axis.svg" width="100%"></object></div>
+        <div style="padding-left: 10px; padding-right: 10px;"><div class="slider" data-slider data-initial-start="0" data-initial-end="100" id="timelineSlider">
+            <span class="slider-handle" data-slider-handle role="slider" tabindex="1"></span>
+            <span class="slider-fill" data-slider-fill></span>
+            <span class="slider-handle" data-slider-handle role="slider" tabindex="1"></span>
+            <input type="hidden" id="timelineStartPercentage">
+            <input type="hidden" id="timelineEndPercentage">
+        </div></div>
+        </div>
+        <div style="overflow-x: hidden;">
+            <div id="timelineView" style="position: relative;">
+                
+                
+                <hr>
+                <h4 class="timeline-headline">Process 27412</h4>
+                
+                
+                
+                <h5 class="timeline-headline">Thread 27412 timeline</h5>
+                <div class="svg-container"><object type="image/svg+xml" data="performance/thread-1.svg" width="100%"></object></div>
+                <hr>
+                
+                
+                
+                <h5 class="timeline-headline">libopenblas64_p-r0-0cf96a72.3.23.dev.so threads</h5>
+                <div class="svg-container-2"><img src="performance/nativethreads-1.svg" width="100%" style="max-height: 288px;"></object></div>
+                <hr>
+                
+                
+                
+                <h5 class="timeline-headline">libopenblasp-r0-23e5df77.3.21.dev.so threads</h5>
+                <div class="svg-container-2"><img src="performance/nativethreads-2.svg" width="100%" style="max-height: 288px;"></object></div>
+                <hr>
+                
+                
+            </div>
+        </div>
+    </div>
+
+    <script>
+     async function populateVersionWarning() {
+         const requestURL = 'https://pypi.org/pypi/sciagraph/json';
+         const response = await fetch(new Request(requestURL));
+         const json = await response.json();
+         const version = json.info.version;
+
+         if (version != "2023.6.1") {
+             const versionElem = document.getElementById("latestSciagraphVersion");
+             versionElem.innerHTML = `(Out-of-date; <a href="https://www.sciagraph.com/docs/reference/release-notes/">latest version is ${version}</a>)`;
+         }
+     }
+     populateVersionWarning();
+
+     function hookUpTimelineSlider() {
+         $("#timelineSlider").on('moved.zf.slider', () => {
+             const timelineStartPercentage = document.getElementById('timelineStartPercentage');
+             const timelineEndPercentage = document.getElementById('timelineEndPercentage');
+             const spanFraction = (timelineEndPercentage.value - timelineStartPercentage.value) / 100.0;
+             const newWidth = 100.0 / spanFraction;
+             const newLeft = -1 * timelineStartPercentage.value / spanFraction;
+             const timelineView = document.getElementById('timelineView');
+             timelineView.style.width = `${newWidth}%`;
+             timelineView.style.left = `${newLeft}%`;
+             var headlines = document.getElementsByClassName('timeline-headline');
+             for (var elem of headlines) {
+                 elem.style.left = `${-(newLeft/newWidth) * 100}%`;
+             }
+         });
+     }
+
+     // Setup Zurb Foundation.
+     $(document).ready(function() {
+         $(document).foundation();
+         hookUpTimelineSlider();
+     })
+    </script>
+
+    </div>
+</body>
+</html>
