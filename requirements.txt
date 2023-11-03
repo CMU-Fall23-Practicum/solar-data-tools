@@ -1,5 +1,4 @@
 # Source : conda-forge
--c conda-forge
 scipy
 numpy>=1.22.0
 pandas
@@ -23,6 +22,5 @@ osqp
 clarabel
 
 # Source: stanfordcvxgrp
--c stanfordcvxgrp
 qss
 sig-decomp

@@ -2,6 +2,9 @@
 HELP="Usage: bootstrap-dask [OPTIONS]
 
 AWS EMR Bootstrap Action to install and configure:
+    solar-data-tools
+        dependencies might be deprecated in the future:
+            cassandra-driver (Cassandra might be replaced by other components in future)
     Dask
     Jupyter
 
@@ -14,14 +17,15 @@ By default it does the following things:
   be disabled with the --no-jupyter flag below.
 
 Options:
-    --jupyter / --no-jupyter    Whether to also install and start a Jupyter
-                                Notebook Server. Default is True.
     --password, -pw             Set the password for the Jupyter Notebook
                                 Server. Default is 'dask-user'.
     --conda-packages            Extra packages to install from conda.
 "
 
 set -e
+
+rm -rf ./root/miniconda
+rm -rf ./sdt
 
 # Parse Inputs. This is specific to this script, and can be ignored
 # -----------------------------------------------------------------
@@ -34,14 +38,6 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "$HELP"
             exit 0
-            ;;
-        --no-jupyter)
-            JUPYTER="false"
-            shift
-            ;;
-        --jupyter)
-            JUPYTER="true"
-            shift
             ;;
         -pw|--password)
             JUPYTER_PASSWORD="$2"
@@ -72,13 +68,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 
-
 # -----------------------------------------------------------------------------
 # 1. Check if running on the master node. If not, there's nothing do.
 # -----------------------------------------------------------------------------
 grep -q '"isMaster": true' /mnt/var/lib/info/instance.json \
 || { echo "Not running on master node, nothing to do" && exit 0; }
-
 
 # -----------------------------------------------------------------------------
 # 2. Install Miniconda
@@ -90,7 +84,6 @@ rm /tmp/miniconda.sh
 echo -e '\nexport PATH=$HOME/miniconda/bin:$PATH' >> $HOME/.bashrc
 source $HOME/.bashrc
 conda update conda -y
-
 
 # -----------------------------------------------------------------------------
 # 3. Install packages to use in packaged environment
@@ -113,32 +106,44 @@ dask-yarn \
 pyarrow \
 s3fs \
 conda-pack \
-tornado=5 \
+tornado \
 $EXTRA_CONDA_PACKAGES
+echo "Successfully installed base packages"
 
 # -----------------------------------------------------------------------------
-# 3.5 Pull solar-data-tools codebase
+# 4. Pull solar-data-tools codebase
 # -----------------------------------------------------------------------------
-apt-get update -qq
-apt-get install build-essential cmake sudo curl nano git -y
+echo "Pull solar-data-tools codebase"
+sudo yum makecache -q
+sudo yum groupinstall -y "Development Tools"
+sudo yum install -y cmake curl nano git glibc-devel
+
 mkdir sdt
 cd ./sdt
 git clone https://github.com/CMU-Fall23-Practicum/solar-data-tools.git
 cd ..
+echo "Successfully pulled solar-data-tools codebase"
 
 # -----------------------------------------------------------------------------
-# 3.6 Install solar-data-tools dependencies
+# 5. Install solar-data-tools dependencies
 # -----------------------------------------------------------------------------
-
+echo "Install solar-data-tools dependencies"
 # Add repositories
 conda config --add channels stanfordcvxgrp
 conda config --add channels conda-forge
 conda config --add channels mosek
 # Install dependencies (listed in requirements.txt)
-conda install --file ./sdt/solar-data-tools/requirements.txt
+conda install -y --quiet --file ./sdt/solar-data-tools/requirements.txt
 # Configure Cassandra
-conda install cassandra-driver
-mkdir ~/.aws
+conda install -y cassandra-driver
+# Check if folder exists, if not, create it
+folder=".aws"
+if [ ! -d "$folder" ]; then
+    mkdir "$folder"
+    echo "Created ~/.aws"
+else
+    echo "~/.aws already exists"
+fi
 echo $'54.176.95.208\n' > ~/.aws/cassandra_cluster
 
 echo "Dask for ${DASK_RUNTIME} successfully initialized."
@@ -148,14 +153,9 @@ echo "Dask for ${DASK_RUNTIME} successfully initialized."
 # -----------------------------------------------------------------------------
 echo "Packaging environment"
 conda pack -q -o $HOME/environment.tar.gz
-
-
-# -----------------------------------------------------------------------------
-# 5. List all packages in the worker environment
-# -----------------------------------------------------------------------------
+# List all packages in the worker environment
 echo "Packages installed in the worker environment:"
 conda list
-
 
 # -----------------------------------------------------------------------------
 # 6. Configure Dask
@@ -196,48 +196,34 @@ EOT
 # Also set ARROW_LIBHDFS_DIR in ~/.bashrc so it's set for the local user
 echo -e '\nexport ARROW_LIBHDFS_DIR=/usr/lib/hadoop/lib/native' >> $HOME/.bashrc
 
-
 # -----------------------------------------------------------------------------
-# 7. If Jupyter isn't requested, we're done
-# -----------------------------------------------------------------------------
-if [[ "$JUPYTER" == "false" ]]; then
-    exit 0
-fi
-
-
-# -----------------------------------------------------------------------------
-# 8. Install jupyter notebook server and dependencies
+# 7. Install jupyter notebook server and dependencies
 #
-# We do this after packaging the worker environments to keep the tar.gz as
-# small as possible.
-#
-# We install the following packages:
+# Install the following packages:
 #
 # - notebook: the Jupyter Notebook Server
 # - ipywidgets: used to provide an interactive UI for the YarnCluster objects
 # - jupyter-server-proxy: used to proxy the dask dashboard through the notebook server
 # -----------------------------------------------------------------------------
-if [[ "$JUPYTER" == "true" ]]; then
-    echo "Installing Jupyter"
-    conda install \
-    -c conda-forge \
-    -y \
-    -q \
-    notebook \
-    ipywidgets \
-    jupyter-server-proxy
-fi
+echo "Installing Jupyter"
+conda install \
+-c conda-forge \
+-y \
+-q \
+notebook \
+ipywidgets \
+jupyter-server-proxy
 
 
 # -----------------------------------------------------------------------------
-# 9. List all packages in the client environment
+# 8. List all packages in the client environment
 # -----------------------------------------------------------------------------
 echo "Packages installed in the client environment:"
 conda list
 
 
 # -----------------------------------------------------------------------------
-# 10. Configure Jupyter Notebook
+# 9. Configure Jupyter Notebook
 # -----------------------------------------------------------------------------
 echo "Configuring Jupyter"
 mkdir -p $HOME/.jupyter
@@ -250,25 +236,30 @@ EOF
 
 
 # -----------------------------------------------------------------------------
-# 11. Define an upstart service for the Jupyter Notebook Server
+# 10. Define an upstart service for the Jupyter Notebook Server
 #
 # This sets the notebook server up to properly run as a background service.
 # -----------------------------------------------------------------------------
 echo "Configuring Jupyter Notebook Upstart Service"
-cat <<EOF > /tmp/jupyter-notebook.conf
-description "Jupyter Notebook Server"
-start on runlevel [2345]
-stop on runlevel [016]
-respawn
-respawn limit unlimited
-exec su - hadoop -c "jupyter notebook" >> /var/log/jupyter-notebook.log 2>&1
-EOF
-sudo mv /tmp/jupyter-notebook.conf /etc/init/
 
+sudo bash -c 'echo "[Unit]
+Description=Jupyter Notebook Server
+After=network.target
+
+[Service]
+User=hadoop
+Restart=always
+ExecStart=/bin/bash -c '\''exec su - hadoop -c \"jupyter notebook >> /var/log/jupyter-notebook.log 2>&1\"'\''
+
+[Install]
+WantedBy=multi-user.target" > /etc/systemd/system/jupyter-notebook.service'
 
 # -----------------------------------------------------------------------------
-# 12. Start the Jupyter Notebook Server
+# 11. Start the Jupyter Notebook Server
 # -----------------------------------------------------------------------------
 echo "Starting Jupyter Notebook Server"
-sudo initctl reload-configuration
-sudo initctl start jupyter-notebook
+# sudo initctl reload-configuration
+# sudo initctl start jupyter-notebook
+## initctl is not available in CentOS, try systemctl below
+sudo systemctl daemon-reload
+sudo systemctl start jupyter-notebook
