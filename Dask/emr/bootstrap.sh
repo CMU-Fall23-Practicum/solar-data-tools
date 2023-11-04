@@ -133,10 +133,14 @@ conda config --add channels stanfordcvxgrp
 conda config --add channels conda-forge
 conda config --add channels mosek
 # Install dependencies (listed in requirements.txt)
-conda install -y --quiet --file ./sdt/solar-data-tools/requirements.txt
+# conda install -y --quiet --file ./sdt/solar-data-tools/requirements.txt
+conda install solar-data-tools
 # Configure Cassandra
 conda install -y cassandra-driver
 # Check if folder exists, if not, create it
+
+# [!] We are replacing Cassandra and the config directory
+# This section needs to be edited when the new system is published
 folder=".aws"
 if [ ! -d "$folder" ]; then
     mkdir "$folder"
@@ -146,10 +150,10 @@ else
 fi
 echo $'54.176.95.208\n' > ~/.aws/cassandra_cluster
 
-echo "Dask for ${DASK_RUNTIME} successfully initialized."
+echo "solar-data-tools dependencies  successfully initialized."
 
 # -----------------------------------------------------------------------------
-# 4. Package the environment to be distributed to worker nodes
+# 6. Package the environment to be distributed to worker nodes
 # -----------------------------------------------------------------------------
 echo "Packaging environment"
 conda pack -q -o $HOME/environment.tar.gz
@@ -158,7 +162,7 @@ echo "Packages installed in the worker environment:"
 conda list
 
 # -----------------------------------------------------------------------------
-# 6. Configure Dask
+# 7. Configure Dask
 #
 # This isn't necessary, but for this particular bootstrap script it will make a
 # few things easier:
@@ -197,7 +201,7 @@ EOT
 echo -e '\nexport ARROW_LIBHDFS_DIR=/usr/lib/hadoop/lib/native' >> $HOME/.bashrc
 
 # -----------------------------------------------------------------------------
-# 7. Install jupyter notebook server and dependencies
+# 8. Install jupyter notebook server and dependencies
 #
 # Install the following packages:
 #
@@ -216,14 +220,14 @@ jupyter-server-proxy
 
 
 # -----------------------------------------------------------------------------
-# 8. List all packages in the client environment
+# 9. List all packages in the client environment
 # -----------------------------------------------------------------------------
 echo "Packages installed in the client environment:"
 conda list
 
 
 # -----------------------------------------------------------------------------
-# 9. Configure Jupyter Notebook
+# 10. Configure Jupyter Notebook
 # -----------------------------------------------------------------------------
 echo "Configuring Jupyter"
 mkdir -p $HOME/.jupyter
@@ -236,11 +240,11 @@ EOF
 
 
 # -----------------------------------------------------------------------------
-# 10. Define an upstart service for the Jupyter Notebook Server
+# 11. Define an on-start service for the Jupyter Notebook Server
 #
 # This sets the notebook server up to properly run as a background service.
 # -----------------------------------------------------------------------------
-echo "Configuring Jupyter Notebook Upstart Service"
+echo "Configuring Jupyter Notebook On-start Service"
 
 sudo bash -c 'echo "[Unit]
 Description=Jupyter Notebook Server
