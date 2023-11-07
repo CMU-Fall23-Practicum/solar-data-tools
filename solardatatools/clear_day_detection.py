@@ -9,6 +9,7 @@ import numpy as np
 import cvxpy as cvx
 from solardatatools.signal_decompositions import tl1_l2d2p365
 from solardatatools.utilities import basic_outlier_filter
+from dask.delayed import delayed
 
 
 class ClearDayDetection:
@@ -45,7 +46,8 @@ class ClearDayDetection:
             smoothness_threshold=0.9,
             energy_threshold=0.8,
             boolean_out=True,
-            solver="OSQP"
+            solver="OSQP",
+            run_with_dask=False,
     ):
         """
         This function quickly finds clear days in a PV power data set. The input to this function is a 2D array containing
@@ -74,7 +76,10 @@ class ClearDayDetection:
         # the score of days if there aren't very many smooth days nearby
         # 7/24/23 SM: Adjusted weight down from 2.5e6 to 2.5e5
         # due to failed decompositions on some datasets (TABJC1001611)
-        self.y = tl1_l2d2p365(self.tc, tau=0.9, w1=2.5e5, yearly_periodic=False, solver=solver)
+        if run_with_dask:
+            self.y = delayed(tl1_l2d2p365)(self.tc, tau=0.9, w1=2.5e5, yearly_periodic=False, solver=solver)
+        else:
+            self.y = tl1_l2d2p365(self.tc, tau=0.9, w1=2.5e5, yearly_periodic=False, solver=solver)
         tc = self.tc/self.y
         # Take the positive part function, i.e. set the negative values to zero.
         # This is the first metric
@@ -85,7 +90,10 @@ class ClearDayDetection:
         self.de = de/np.nanmax(de)
         # Solve a convex minimization problem to roughly fit the local 90th
         # percentile of the data (quantile regression)
-        self.x = tl1_l2d2p365(self.de, tau=0.9, w1=2e5, yearly_periodic=False, solver=solver)
+        if run_with_dask:
+            self.x = dask.delayed(tl1_l2d2p365)(self.de, tau=0.9, w1=2e5, yearly_periodic=False, solver=solver)
+        else:
+            self.x = tl1_l2d2p365(self.de, tau=0.9, w1=2e5, yearly_periodic=False, solver=solver)
         # x gives us the local top 90th percentile of daily energy, i.e. the very sunny days. This gives us our
         # seasonal normalization.
         de = np.clip(np.divide(self.de, self.x), 0, 1)

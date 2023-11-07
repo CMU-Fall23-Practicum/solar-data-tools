@@ -17,6 +17,7 @@ power production data sets. The algorithm works as follows:
 import numpy as np
 from solardatatools.signal_decompositions import l1_l1d1_l2d2p365
 from sklearn.cluster import DBSCAN
+from dask.delayed import delayed
 
 
 class CapacityChange:
@@ -34,7 +35,8 @@ class CapacityChange:
         quantile=1.00,
         w1=40e-6,  # scaled weights for QSS
         w2=6561e-6,
-        solver=None
+        solver=None,
+        run_with_dask=False,
     ):
         if filter is None:
             filter = np.ones(data.shape[1], dtype=bool)
@@ -42,14 +44,24 @@ class CapacityChange:
             metric = np.nanquantile(data, q=quantile, axis=0)
             metric /= np.max(metric)
 
-            s1, s2, s3 = l1_l1d1_l2d2p365(
-                metric,
-                use_ixs=filter,
-                w1=w1,
-                w2=w2,
-                solver=solver,
-                sum_card=True
-            )
+            if run_with_dask:
+                s1, s2, s3 = delayed(l1_l1d1_l2d2p365)(
+                    metric,
+                    use_ixs=filter,
+                    w1=w1,
+                    w2=w2,
+                    solver=solver,
+                    sum_card=True
+                )
+            else:
+                s1, s2, s3 = l1_l1d1_l2d2p365(
+                    metric,
+                    use_ixs=filter,
+                    w1=w1,
+                    w2=w2,
+                    solver=solver,
+                    sum_card=True
+                )
         else:
             # print('No valid values! Please check your data and filter.')
             return

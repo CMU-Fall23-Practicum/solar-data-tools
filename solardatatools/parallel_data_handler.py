@@ -1,11 +1,12 @@
-from solardatatools import DataHandler
+# from solardatatools import DataHandler
+from solardatatools.data_handler import DataHandler
 from dask.distributed import Client
 import dask.delayed
 import pandas as pd
 import os
 
 
-@dask.delayed
+# @dask.delayed
 def run_job(data, data_retrieval_fn):
     """
     Processes a single unit of data using DataHandler.
@@ -20,9 +21,9 @@ def run_job(data, data_retrieval_fn):
     - A dictionary containing the name of the data and the processed report.
     """
     name, data_frame = data_retrieval_fn(data)
-    data_handler = DataHandler(data_frame, convert_to_ts=True,)
-    # data_handler.run_pipeline(power_col='ac_power_01', solver_convex="OSQP")
-    data_handler.run_pipeline(power_col='ac_power_01', )
+    data_handler = DataHandler(data_frame, convert_to_ts=True, run_with_dask=True)
+    data_handler.run_pipeline(power_col='ac_power_01', solver_convex="OSQP")
+    # data_handler.run_pipeline(power_col='ac_power_01', )
     report = {}
     report["name"] = name
     report["data"] = data_handler.report(verbose=True, return_values=True)

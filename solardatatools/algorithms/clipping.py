@@ -9,6 +9,7 @@ import cvxpy as cvx
 from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
 from solardatatools.signal_decompositions import l2_l1d2_constrained
+from dask.delayed import delayed
 
 
 class ClippingDetection:
@@ -45,6 +46,7 @@ class ClippingDetection:
         solver=None,
         verbose=False,
         weight=5,
+        run_with_dask=False,
     ):
         self.num_days = data_matrix.shape[1]
         self.num_rows = data_matrix.shape[0]
@@ -78,6 +80,7 @@ class ClippingDetection:
             solver=solver,
             verbose=verbose,
             weight=weight,
+            run_with_dask=run_with_dask,
         )
         pm_neighborhood_threshold = 0.0075
         try:
@@ -128,7 +131,7 @@ class ClippingDetection:
             self.clipping_mask = np.zeros((self.num_rows, self.num_days), dtype=bool)
 
     def pointmass_detection(
-        self, data, threshold=-0.35, solver=None, verbose=False, weight=5
+        self, data, threshold=-0.35, solver=None, verbose=False, weight=5, run_with_dask=False
     ):
         self.threshold = threshold
         x_rs, y_rs = self.calculate_cdf(data)
@@ -136,7 +139,7 @@ class ClippingDetection:
         self.cdf_y = y_rs
         # Fit statistical model to resampled CDF that has sparse 2nd order difference
         if self.y_param is None:
-            self.get_l2_l1d2(y_rs, weight=weight, solver=solver)
+            self.get_l2_l1d2(y_rs, weight=weight, solver=solver, run_with_dask=run_with_dask)
         else:
             self.y_param = y_rs
             self.weight = weight
@@ -369,8 +372,12 @@ class ClippingDetection:
         y_rs = f(x_rs)
         return x_rs, y_rs
 
-    def get_l2_l1d2(self, y, weight=5, solver=None):
-        out = l2_l1d2_constrained(y, w1=weight, solver=solver)
+    def get_l2_l1d2(self, y, weight=5, solver=None, run_with_dask=False):
+        if run_with_dask:
+            out = delayed(l2_l1d2_constrained)(y, w1=weight, solver=solver)
+        else:
+            out = l2_l1d2_constrained(y, w1=weight, solver=solver)
+
 
         self.y_param = out[0]
         self.y_hat = out[1]

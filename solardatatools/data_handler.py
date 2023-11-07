@@ -39,6 +39,7 @@ from solardatatools.algorithms import (
     ClippingDetection,
 )
 from pandas.plotting import register_matplotlib_converters
+from dask.delayed import delayed
 
 register_matplotlib_converters()
 from solardatatools.polar_transform import PolarTransform
@@ -55,6 +56,7 @@ class DataHandler:
         aggregate=None,
         how=lambda x: x.mean(),
         gmt_offset=None,
+        run_with_dask=False
     ):
         if data_frame is not None:
             if convert_to_ts:
@@ -105,6 +107,7 @@ class DataHandler:
             self.num_days = None
             self.data_sampling = None
         self.gmt_offset = gmt_offset
+        self.run_with_dask = run_with_dask
         self._initialize_attributes()
 
     def _initialize_attributes(self):
@@ -831,6 +834,11 @@ time zone errors     {report['time zone correction'] != 0}
             return_density_signal=True,
             return_fit=True,
             solver=solver,
+            # run_with_dask=self.run_with_dask,
+            # setting run_with_dask == False because make_linearity_scores will eventually fail
+            # attempting to use a delayed object returned by this function as a a bool. 
+            # This isn't allowed to determine execution flow. May need to permanently remove functionality
+            run_with_dask=True,
         )
         self.daily_scores.density = s1
         self.daily_signals.density = s2
@@ -871,6 +879,7 @@ time zone errors     {report['time zone correction'] != 0}
             self.filled_data_matrix,
             no_error_flag=self.daily_flags.no_errors,
             solver=solver,
+            run_with_dask=True
         )
         self.inverter_clipping = self.clipping_analysis.inverter_clipping
         self.num_clip_points = self.clipping_analysis.num_clip_points
@@ -896,6 +905,10 @@ time zone errors     {report['time zone correction'] != 0}
                 w1=40e-6,  # scaled weights for QSS
                 w2=6561e-6,
                 solver=solver,
+                # Setting run_with_dask to false to resolve error downstream. May need
+                # to remove functionality permanently 
+                # run_with_dask=self.run_with_dask,
+                run_with_dask=True,
             )
         if len(set(self.capacity_analysis.labels)) > 1:
             self.capacity_changes = True
@@ -1034,6 +1047,7 @@ time zone errors     {report['time zone correction'] != 0}
             smoothness_threshold=smoothness_threshold,
             energy_threshold=energy_threshold,
             solver=solver,
+            run_with_dask=True,
         )
         # Remove days that are marginally low density, but otherwise pass
         # the clearness test. Occasionally, we find an early morning or late

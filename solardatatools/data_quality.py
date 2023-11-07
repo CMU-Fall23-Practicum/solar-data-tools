@@ -8,6 +8,7 @@ This module contains functions for identifying corrupt or bad quality data.
 import numpy as np
 from scipy.stats import mode
 from solardatatools.signal_decompositions import tl1_l2d2p365
+from dask.delayed import delayed
 
 
 def make_quality_flags(
@@ -31,6 +32,7 @@ def make_density_scores(
     return_density_signal=False,
     return_fit=False,
     solver=None,
+    run_with_dask=False,
 ):
     nans = np.isnan(data_matrix)
     capacity_est = np.quantile(data_matrix[~nans], 0.95)
@@ -39,7 +41,10 @@ def make_density_scores(
     foo = data_copy > 0.02 * capacity_est
     density_signal = np.sum(foo, axis=0) / data_matrix.shape[0]
     use_days = np.logical_and(density_signal > threshold, density_signal < 0.8)
-    fit_signal = tl1_l2d2p365(density_signal, use_ixs=use_days, tau=0.85, solver=solver)
+    if run_with_dask:
+        fit_signal = delayed(tl1_l2d2p365)(density_signal, use_ixs=use_days, tau=0.85, solver=solver)
+    else:
+        fit_signal = tl1_l2d2p365(density_signal, use_ixs=use_days, tau=0.85, solver=solver)
     scores = density_signal / fit_signal
     out = [scores]
     if return_density_signal:
