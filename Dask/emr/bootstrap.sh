@@ -231,7 +231,7 @@ conda list
 # -----------------------------------------------------------------------------
 echo "Configuring Jupyter"
 mkdir -p $HOME/.jupyter
-HASHED_PASSWORD=`python -c "from notebook.auth import passwd; print(passwd('$JUPYTER_PASSWORD'))"`
+HASHED_PASSWORD=`python -c "from jupyter_server.auth import passwd; print(passwd('$JUPYTER_PASSWORD'))"`
 cat <<EOF >> $HOME/.jupyter/jupyter_notebook_config.py
 c.NotebookApp.password = u'$HASHED_PASSWORD'
 c.NotebookApp.open_browser = False
