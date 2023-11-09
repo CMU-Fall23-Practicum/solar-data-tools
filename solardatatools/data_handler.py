@@ -838,7 +838,7 @@ time zone errors     {report['time zone correction'] != 0}
             # setting run_with_dask == False because make_linearity_scores will eventually fail
             # attempting to use a delayed object returned by this function as a a bool. 
             # This isn't allowed to determine execution flow. May need to permanently remove functionality
-            run_with_dask=True,
+            run_with_dask=False,
         )
         self.daily_scores.density = s1
         self.daily_signals.density = s2
@@ -879,7 +879,7 @@ time zone errors     {report['time zone correction'] != 0}
             self.filled_data_matrix,
             no_error_flag=self.daily_flags.no_errors,
             solver=solver,
-            run_with_dask=True
+            run_with_dask=False
         )
         self.inverter_clipping = self.clipping_analysis.inverter_clipping
         self.num_clip_points = self.clipping_analysis.num_clip_points
@@ -908,7 +908,7 @@ time zone errors     {report['time zone correction'] != 0}
                 # Setting run_with_dask to false to resolve error downstream. May need
                 # to remove functionality permanently 
                 # run_with_dask=self.run_with_dask,
-                run_with_dask=True,
+                run_with_dask=False,
             )
         if len(set(self.capacity_analysis.labels)) > 1:
             self.capacity_changes = True
@@ -1047,7 +1047,7 @@ time zone errors     {report['time zone correction'] != 0}
             smoothness_threshold=smoothness_threshold,
             energy_threshold=energy_threshold,
             solver=solver,
-            run_with_dask=True,
+            run_with_dask=False,
         )
         # Remove days that are marginally low density, but otherwise pass
         # the clearness test. Occasionally, we find an early morning or late
