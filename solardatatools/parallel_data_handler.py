@@ -451,6 +451,8 @@ def run_pipeline_in_parallel(df,
     # @dask.delayed
     def clipping_check():
         return
+
+
     @dask.delayed
     def detect_clear_days(inputs,
                           smoothness_threshold=0.9, 
@@ -476,6 +478,8 @@ def run_pipeline_in_parallel(df,
         results["daily_flags"] = deepcopy(inputs["daily_flags"])
         results["daily_flags"].flag_clear_cloudy(clear_days)
         return results
+
+
     # @dask.delayed
     def score_dataset():
         return
@@ -546,7 +550,7 @@ def run_job(data, data_retrieval_fn):
     # data_handler = DataHandler(data_frame, convert_to_ts=True,)
     # data_handler.run_pipeline(power_col='ac_power_01', solver_convex="OSQP")
     # data_handler.run_pipeline(power_col='ac_power_01', )
-    data = run_pipeline_in_parallel(data_frame)
+    data = run_pipeline_in_parallel(data_frame, power_col='ac_power_01')
     report = {}
     # report["name"] = name
     # report["data"] = data
