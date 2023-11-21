@@ -1,9 +1,14 @@
 ## SSH Dask Cluster
 In the case of setting up dask clusters not managed through integrated cloud provider solutions, we consider that there are typically 2 scenarios:  
+
 1. Setting up the cluster with virtual machines on the cloud.  
-2. Setting up the cluster with client's own machines.  
-Generally speaking, steps for setting up the machines are similar for both cases. They can be separated into 2 steps:  
-1. Install requirements on the machines.  
+
+2. Setting up the cluster with client's own machines.
+
+Generally speaking, steps for setting up the machines are similar for both cases. They can be separated into 2 steps:
+
+1. Install requirements on the machines.
+
 2. Setup the cluster through dask python interface.  
 We will provide our python code in this folder. 
 ### More recommendations for setting up SSH cluster on the cloud
