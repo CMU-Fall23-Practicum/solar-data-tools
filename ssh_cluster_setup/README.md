@@ -18,3 +18,8 @@ In contrast, we have conducted extensive research in the scenarion where our cli
 * If we run the setup script from a machine from outside the VPC (e.g. our local machine), the setup script will run into a complicated IP binding problem. We ourselves have tried to resolve the problem, but failed after days of work. Many attempt have been made in [this stackoverflow post](https://stackoverflow.com/questions/74265724/best-practices-when-deploying-dask-cloudprovider-ec2-cluster-while-allowing-publ). Some looks promising to us, but we have decided that those are too complicated for the purpose of our tutorial. If the users **have to go through so many trouble to achieve the same thing they would have achieved simply by moving the script to within the VPC**, then it is pointless trying to educate our users on that subject matter.
 * In conclusion, we recommend **simply run the script from within the VPC**. Of course, as Dask continues to develope, this may be resolved in the future.
 * Our example script is also included in this folder.
+
+### Appendix: some debugging tips while using AWS EC2
+1. Please make sure your dependencies are up-to-date. To us the problem was pyopenssl. upgrade with `pip install --upgrade pyopenssl`.  
+2. To us, setting up ssh clusters with pem files is not really working as expected. But switching to password authentication works. So we would recommend that if you are having authorization issues with ssh setup.  
+3. To run solar-data-tools run_pipeline, make sure your EC2 instances has a memory greater than 16 GB. (By default, AWS EC2 instances has a memory of 1GB, and cannot be modified after innitializations).
